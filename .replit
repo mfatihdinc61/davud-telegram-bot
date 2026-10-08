@@ -1,0 +1,11 @@
+# Replit config — the student just clicks the big green Run button.
+# This installs the libraries (hidden) and then starts the bot.
+run = "python -m pip install -q -r requirements.txt && python bot.py"
+entrypoint = "bot.py"
+modules = ["python-3.11"]
+
+[nix]
+channel = "stable-24_05"
+
+# Keys are NOT stored here. Add them in the Replit "Secrets" tool (lock icon):
+#   TELEGRAM_TOKEN   and   GEMINI_API_KEY
