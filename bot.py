@@ -1,16 +1,30 @@
 # Davud's Telegram buddy — a simple AI agent in one file.
 #
-# HOW TO RUN:
-#   1) pip install -r requirements.txt
-#   2) copy .env.example to .env and paste in your two keys
-#   3) python bot.py   ->  then message your bot in Telegram
+# WHAT IT CAN DO:
+#   • chat like a friendly human (and call the user "Davud")
+#   • look at photos you send
+#   • answer price questions (from the PRICES list below)
+#   • send you a human-sounding weather heads-up each morning  (/testweather to try now)
+#   • relay a message to a friend and bring their reply back    (/ask  Name | message)
+#   • send an email on your behalf, with a confirm step         (/email to | subject | body)
 #
-# To change things: edit PRICES and CITY just below.
+# HOW TO RUN (locally):
+#   1) pip install -r requirements.txt
+#   2) copy .env.example to .env and fill in your keys
+#   3) python bot.py
+# On Replit: just add the Secrets (below) and press Run.
+#
+# SECRETS / .env keys:
+#   TELEGRAM_TOKEN, GEMINI_API_KEY            (required)
+#   SMTP_HOST, SMTP_PORT, SMTP_USER,          (only if you want the email feature)
+#   SMTP_PASSWORD, EMAIL_FROM, ALLOWED_EMAILS
 
 import os
 import json
 import asyncio
+import smtplib
 import datetime
+from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
 import requests
@@ -24,7 +38,7 @@ from telegram.ext import (
 
 # ---------- things you can edit ----------
 CITY = "Istanbul"                         # city for the morning weather heads-up
-TIMEZONE = "Europe/Istanbul"              # used so the morning message fires at local 07:30
+TIMEZONE = "Europe/Istanbul"              # so the morning message fires at local 07:30
 PRICES = {                                # the bot answers "how much...?" from this list
     "haircut": "300 TL",
     "hair coloring": "800 TL",
@@ -35,6 +49,15 @@ MODEL = "gemini-2.5-flash"                # the AI brain (free tier is fine)
 load_dotenv()
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+# Email settings (optional — the bot still works without them)
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+ALLOWED_EMAILS = [e.strip().lower() for e in os.environ.get("ALLOWED_EMAILS", "").split(",") if e.strip()]
+EMAIL_READY = bool(SMTP_USER and SMTP_PASSWORD)
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -50,54 +73,72 @@ You know these prices and can answer "how much does it cost?" questions:
 {price_lines}
 If he asks about something not on the list, say you're not sure of that price.
 
+You can also do two actions through commands — if Davud asks how to message a friend or send an
+email, tell him:
+- To message a friend who has also opened me: /ask Name | your message
+- To send an email: /email address | subject | message
+
 Keep replies brief and friendly, like a real text conversation."""
 
-# Remember chat ids so the morning message can reach everyone, even after a restart.
-CHATS_FILE = "chats.json"
+# ---------- saved data (survives restarts) ----------
+PEOPLE_FILE = "people.json"   # everyone who has opened the bot: name -> chat id
 
 
-def load_chats() -> set:
+def load_people() -> dict:
     try:
-        with open(CHATS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
+        with open(PEOPLE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        return {}
 
 
-def save_chats(chats: set) -> None:
+def save_people() -> None:
     try:
-        with open(CHATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(chats), f)
+        with open(PEOPLE_FILE, "w", encoding="utf-8") as f:
+            json.dump(people, f, ensure_ascii=False)
     except OSError:
         pass
 
 
-known_chats = load_chats()
-# Short per-chat conversation memory (kept in RAM): { chat_id: [ {role, text}, ... ] }
-history: dict[int, list] = {}
+people: dict = load_people()   # { "<chat_id>": {"name": "...", "username": "..."} }
+
+# ---------- in-memory state (fine to lose on restart) ----------
+history: dict[int, list] = {}          # short chat memory per person
+awaiting_reply: dict[int, tuple] = {}  # recipient_chat_id -> (sender_chat_id, sender_name)
+pending_email: dict[int, dict] = {}    # chat_id -> {"to","subject","body"} waiting for /yes
 
 
-def remember_chat(chat_id: int) -> None:
-    if chat_id not in known_chats:
-        known_chats.add(chat_id)
-        save_chats(known_chats)
+def register_person(update: Update) -> None:
+    """Remember anyone who talks to the bot, so we can find them by name later."""
+    user = update.effective_user
+    cid = str(update.effective_chat.id)
+    name = (user.first_name or user.username or "friend").strip()
+    people[cid] = {"name": name, "username": (user.username or "")}
+    save_people()
 
 
-# ---------- the AI calls (these are blocking, so we run them in a thread) ----------
+def find_chat_by_name(name: str):
+    """Look up a person's chat id by their first name or @username (case-insensitive)."""
+    key = name.strip().lstrip("@").lower()
+    for cid, info in people.items():
+        if info["name"].lower() == key or info["username"].lower() == key:
+            return int(cid)
+    return None
+
+
+# ---------- the AI + network calls (blocking, so we run them in a thread) ----------
 
 def ask_gemini(chat_id: int, user_text: str) -> str:
     """Reply to a text message, remembering the last few turns of the chat."""
     turns = history.setdefault(chat_id, [])
     turns.append({"role": "user", "text": user_text})
-    turns[:] = turns[-10:]  # keep only the last 10 messages
-
+    turns[:] = turns[-10:]
     contents = [
         types.Content(role=t["role"], parts=[types.Part.from_text(text=t["text"])])
         for t in turns
     ]
     resp = client.models.generate_content(
-        model=MODEL,
-        contents=contents,
+        model=MODEL, contents=contents,
         config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.8),
     )
     reply = (resp.text or "").strip() or "Hmm, I didn't catch that — say it again?"
@@ -106,83 +147,200 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
 
 
 def ask_gemini_about_photo(image_bytes: bytes, caption: str) -> str:
-    """Look at a photo Davud sent and react to it."""
     question = caption.strip() or "Davud sent you this photo. React warmly and briefly, and say what you see."
-    contents = [
-        types.Content(role="user", parts=[
-            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-            types.Part.from_text(text=question),
-        ])
-    ]
+    contents = [types.Content(role="user", parts=[
+        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+        types.Part.from_text(text=question),
+    ])]
     resp = client.models.generate_content(
-        model=MODEL,
-        contents=contents,
+        model=MODEL, contents=contents,
         config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.7),
     )
     return (resp.text or "").strip() or "Nice photo, Davud! 📷"
 
 
 def get_weather(city: str) -> dict:
-    """Today's weather for a city, using the free Open-Meteo API (no key needed)."""
-    geo = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": city, "count": 1}, timeout=15,
-    ).json()
+    """Today's weather for a city, from the free Open-Meteo API (no key needed)."""
+    geo = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                       params={"name": city, "count": 1}, timeout=15).json()
     place = geo["results"][0]
-    fc = requests.get(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": place["latitude"], "longitude": place["longitude"],
-            "daily": "precipitation_probability_max,temperature_2m_max,temperature_2m_min",
-            "timezone": "auto",
-        }, timeout=15,
-    ).json()
-    daily = fc["daily"]
-    return {
-        "city": city,
-        "temp_max": daily["temperature_2m_max"][0],
-        "temp_min": daily["temperature_2m_min"][0],
-        "rain_chance": daily["precipitation_probability_max"][0],
-    }
+    fc = requests.get("https://api.open-meteo.com/v1/forecast", params={
+        "latitude": place["latitude"], "longitude": place["longitude"],
+        "daily": "precipitation_probability_max,temperature_2m_max,temperature_2m_min",
+        "timezone": "auto",
+    }, timeout=15).json()
+    d = fc["daily"]
+    return {"city": city, "temp_max": d["temperature_2m_max"][0],
+            "temp_min": d["temperature_2m_min"][0], "rain_chance": d["precipitation_probability_max"][0]}
 
 
 def human_weather_line(data: dict) -> str:
-    """Ask the AI to phrase a short, human-sounding weather heads-up for Davud."""
-    prompt = (
-        f"Write ONE short, warm, human text to Davud about today's weather in {data['city']}. "
-        f"High {data['temp_max']}°C, low {data['temp_min']}°C, rain chance {data['rain_chance']}%. "
-        f"Mention taking an umbrella only if rain chance is 50% or more. "
-        f"Under 25 words, casual, at most one emoji."
-    )
+    prompt = (f"Write ONE short, warm, human text to Davud about today's weather in {data['city']}. "
+              f"High {data['temp_max']}°C, low {data['temp_min']}°C, rain chance {data['rain_chance']}%. "
+              f"Mention taking an umbrella only if rain chance is 50% or more. "
+              f"Under 25 words, casual, at most one emoji.")
     try:
-        resp = client.models.generate_content(
-            model=MODEL, contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.9),
-        )
+        resp = client.models.generate_content(model=MODEL, contents=prompt,
+                                               config=types.GenerateContentConfig(temperature=0.9))
         line = (resp.text or "").strip()
         if line:
             return line
     except Exception:
         pass
-    # Fallback if the AI call fails
     umbrella = " Take an umbrella ☔" if data["rain_chance"] >= 50 else ""
     return f"Morning Davud! Around {data['temp_max']}°C today in {data['city']}.{umbrella}"
 
 
-# ---------- Telegram handlers ----------
+def send_email_smtp(to: str, subject: str, body: str) -> None:
+    """Send a plain-text email over SMTP (e.g. Gmail with an App Password)."""
+    msg = EmailMessage()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.send_message(msg)
+
+
+# ---------- Telegram command handlers ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    remember_chat(update.effective_chat.id)
-    await update.message.reply_text("Hey Davud! 👋 I'm here whenever you need me — ask me anything, "
-                                    "send me a photo, or just say hi.")
+    register_person(update)
+    await update.message.reply_text(
+        "Hey Davud! 👋 I'm here whenever you need me. Ask me anything, send a photo, "
+        "or type /help to see what I can do.")
 
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_person(update)
+    await update.message.reply_text(
+        "Here's what I can do:\n"
+        "• Just chat with me 💬\n"
+        "• Send me a photo 📷\n"
+        "• Ask about prices (e.g. \"how much is a haircut?\")\n"
+        "• /who  — see which friends I know\n"
+        "• /ask Name | message  — send a friend a message and I'll bring their reply back\n"
+        "• /email address | subject | message  — I'll draft an email and ask you to confirm\n"
+        "• /testweather 🌦️  — get the morning-style weather now")
+
+
+async def who(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_person(update)
+    names = sorted({info["name"] for info in people.values()})
+    if names:
+        await update.message.reply_text("People who've opened me:\n• " + "\n• ".join(names) +
+                                        "\n\nMessage one with:  /ask Name | your message")
+    else:
+        await update.message.reply_text("No one yet — ask your friend to open me and press Start first.")
+
+
+async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Relay a message to a friend. Their next reply comes back to the sender."""
+    register_person(update)
+    chat_id = update.effective_chat.id
+    payload = update.message.text.partition(" ")[2]
+    if "|" not in payload:
+        await update.message.reply_text("Try:  /ask Name | your message\n(See /who for who I know.)")
+        return
+    name, _, message = payload.partition("|")
+    name, message = name.strip(), message.strip()
+    target = find_chat_by_name(name)
+    if target is None:
+        await update.message.reply_text(
+            f"I don't know anyone called \"{name}\" yet. They need to open me and press Start first. "
+            f"(Type /who to see who I know.)")
+        return
+    if target == chat_id:
+        await update.message.reply_text("That's you 😄 — pick a friend who has opened me.")
+        return
+    sender_name = people[str(chat_id)]["name"]
+    try:
+        await context.bot.send_message(
+            target,
+            f"📩 {sender_name} asks:\n\n{message}\n\n(Just reply here and I'll send your answer back.)")
+    except Exception:
+        await update.message.reply_text(f"Hmm, I couldn't reach {name} right now 😕")
+        return
+    awaiting_reply[target] = (chat_id, sender_name)
+    await update.message.reply_text(f"Sent to {name}. I'll bring their reply back to you. 📨")
+
+
+async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Draft an email and ask the user to confirm before sending."""
+    register_person(update)
+    chat_id = update.effective_chat.id
+    if not EMAIL_READY:
+        await update.message.reply_text("Email isn't set up yet — ask the teacher to add the SMTP secrets.")
+        return
+    payload = update.message.text.partition(" ")[2]
+    parts = [p.strip() for p in payload.split("|", 2)]
+    if len(parts) < 3 or not all(parts):
+        await update.message.reply_text("Try:  /email address | subject | message")
+        return
+    to, subject, body = parts
+    if ALLOWED_EMAILS and to.lower() not in ALLOWED_EMAILS:
+        await update.message.reply_text(f"I'm only allowed to email: {', '.join(ALLOWED_EMAILS)}")
+        return
+    pending_email[chat_id] = {"to": to, "subject": subject, "body": body}
+    await update.message.reply_text(
+        f"📧 Ready to send:\n\nTo: {to}\nSubject: {subject}\n\n{body}\n\n"
+        f"Reply /yes to send, or /no to cancel.")
+
+
+async def yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    e = pending_email.pop(chat_id, None)
+    if not e:
+        await update.message.reply_text("Nothing to confirm right now.")
+        return
+    try:
+        await asyncio.to_thread(send_email_smtp, e["to"], e["subject"], e["body"])
+        await update.message.reply_text(f"Sent to {e['to']} ✅")
+    except Exception:
+        await update.message.reply_text("Couldn't send that one 😕 — check the email setup (SMTP keys / App Password).")
+
+
+async def no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if pending_email.pop(update.effective_chat.id, None):
+        await update.message.reply_text("Okay, cancelled. 👍")
+    else:
+        await update.message.reply_text("Nothing to cancel.")
+
+
+async def testweather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_person(update)
+    await send_morning(context)
+
+
+# ---------- message handlers ----------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    remember_chat(chat_id)
+    register_person(update)
+    text = update.message.text
+
+    # If this person owes a reply to a relayed message, pass it back to the sender.
+    if chat_id in awaiting_reply:
+        sender_id, sender_name = awaiting_reply.pop(chat_id)
+        my_name = people[str(chat_id)]["name"]
+        try:
+            await context.bot.send_message(sender_id, f"💬 {my_name} replied:\n\n{text}")
+            await update.message.reply_text(f"Got it — I passed your reply back to {sender_name}. ✅")
+        except Exception:
+            await update.message.reply_text("I couldn't deliver that reply 😕")
+        return
+
+    # Otherwise it's a normal chat with the AI.
     await context.bot.send_chat_action(chat_id, "typing")
     try:
-        reply = await asyncio.to_thread(ask_gemini, chat_id, update.message.text)
+        reply = await asyncio.to_thread(ask_gemini, chat_id, text)
     except Exception:
         reply = "Oops, my brain hiccuped 😅 try again?"
     await update.message.reply_text(reply)
@@ -190,14 +348,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    remember_chat(chat_id)
+    register_person(update)
     await context.bot.send_chat_action(chat_id, "typing")
     try:
-        photo = update.message.photo[-1]                 # biggest size
+        photo = update.message.photo[-1]
         tg_file = await photo.get_file()
         img_bytes = bytes(await tg_file.download_as_bytearray())
-        caption = update.message.caption or ""
-        reply = await asyncio.to_thread(ask_gemini_about_photo, img_bytes, caption)
+        reply = await asyncio.to_thread(ask_gemini_about_photo, img_bytes, update.message.caption or "")
     except Exception:
         reply = "Hmm, I couldn't open that photo 😅 mind sending it again?"
     await update.message.reply_text(reply)
@@ -209,32 +366,30 @@ async def send_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
         data = await asyncio.to_thread(get_weather, CITY)
         line = await asyncio.to_thread(human_weather_line, data)
     except Exception:
-        line = f"Morning Davud! Couldn't check the weather right now 😅"
-    for chat_id in list(known_chats):
+        line = "Morning Davud! Couldn't check the weather right now 😅"
+    for cid in list(people.keys()):
         try:
-            await context.bot.send_message(chat_id, line)
+            await context.bot.send_message(int(cid), line)
         except Exception:
             pass
-
-
-async def testweather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    remember_chat(update.effective_chat.id)
-    await send_morning(context)
 
 
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("who", who))
+    app.add_handler(CommandHandler("ask", ask))
+    app.add_handler(CommandHandler("email", email_cmd))
+    app.add_handler(CommandHandler("yes", yes))
+    app.add_handler(CommandHandler("no", no))
     app.add_handler(CommandHandler("testweather", testweather))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Morning heads-up at 07:30 local time.
-    app.job_queue.run_daily(
-        send_morning,
-        time=datetime.time(hour=7, minute=30, tzinfo=ZoneInfo(TIMEZONE)),
-    )
+    app.job_queue.run_daily(send_morning,
+                            time=datetime.time(hour=7, minute=30, tzinfo=ZoneInfo(TIMEZONE)))
 
     print("Ready!")
     app.run_polling()
