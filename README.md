@@ -10,11 +10,15 @@ A simple one-file AI agent that:
 
 ## Keys (Secrets / .env)
 **Required:** `TELEGRAM_TOKEN`, `GEMINI_API_KEY`
-**Optional — only for the email feature:** `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
-`SMTP_PASSWORD`, `EMAIL_FROM`, `ALLOWED_EMAILS`
-- For **Gmail**: turn on 2-Step Verification, create an **App Password**, and use that as
-  `SMTP_PASSWORD` (a normal password won't work).
-- `ALLOWED_EMAILS` (optional) limits who the bot may email — leave blank to allow any.
+
+**Optional — email, pick ONE way:**
+- **Resend (easiest):** `RESEND_API_KEY` + `EMAIL_FROM`. One key from [resend.com](https://resend.com),
+  no app password. To email **anyone**, verify a domain in Resend and set `EMAIL_FROM=bot@yourdomain`.
+  (The shared tester `onboarding@resend.dev` only delivers to your own Resend inbox.)
+- **SMTP (Gmail/Yandex):** `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM` —
+  needs an **App Password** (a normal password won't work).
+
+`ALLOWED_EMAILS` (optional) limits who the bot may email — **leave blank to allow anyone**.
 
 ## Run it
 Cloud (recommended): see **REPLIT-SETUP.md**.

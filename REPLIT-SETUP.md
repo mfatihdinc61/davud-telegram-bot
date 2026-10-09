@@ -28,9 +28,11 @@ on his phone. No Python, no pip, nothing installed on his computer.
 2. Add two secrets:
    - key `TELEGRAM_TOKEN` → value: your BotFather token
    - key `GEMINI_API_KEY` → value: your Gemini key
-3. *(Optional — for the email feature)* also add: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`,
-   `SMTP_PASSWORD`, `EMAIL_FROM`, and optionally `ALLOWED_EMAILS`. For Gmail, `SMTP_PASSWORD`
-   must be an **App Password** (turn on 2-Step Verification first). Skip these to leave email off.
+3. *(Optional — for the email feature)* easiest is **Resend**: add `RESEND_API_KEY` (from
+   resend.com) and `EMAIL_FROM`. To email anyone, verify a domain in Resend and use e.g.
+   `EMAIL_FROM=bot@yourdomain`. *(Or use SMTP instead: `SMTP_HOST/PORT/USER/PASSWORD` with a
+   Gmail/Yandex App Password.)* Add `ALLOWED_EMAILS` to restrict recipients, or leave it blank for
+   anyone. Skip all of these to leave email off.
 4. That's it — the code reads these automatically.
 
 ### 4. Press ▶ Run

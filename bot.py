@@ -16,8 +16,10 @@
 #
 # SECRETS / .env keys:
 #   TELEGRAM_TOKEN, GEMINI_API_KEY            (required)
-#   SMTP_HOST, SMTP_PORT, SMTP_USER,          (only if you want the email feature)
-#   SMTP_PASSWORD, EMAIL_FROM, ALLOWED_EMAILS
+#   Email (optional) — pick ONE way:
+#     easy:  RESEND_API_KEY  (+ EMAIL_FROM on a verified domain)
+#     or:    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, EMAIL_FROM
+#   ALLOWED_EMAILS  (optional allowlist; blank = send to anyone)
 
 import os
 import json
@@ -50,14 +52,20 @@ load_dotenv()
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# Email settings (optional — the bot still works without them)
+# Email settings (optional — the bot still works without them).
+# Two ways to send: the Resend API (easiest — one key) OR SMTP (needs an app password).
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+# Who the email is "from". For Resend you need a verified-domain address (e.g. bot@yourdomain);
+# the shared tester "onboarding@resend.dev" only delivers to your own Resend account email.
+EMAIL_FROM = (os.environ.get("EMAIL_FROM", "").strip()
+              or SMTP_USER
+              or ("onboarding@resend.dev" if RESEND_API_KEY else ""))
 ALLOWED_EMAILS = [e.strip().lower() for e in os.environ.get("ALLOWED_EMAILS", "").split(",") if e.strip()]
-EMAIL_READY = bool(SMTP_USER and SMTP_PASSWORD)
+EMAIL_READY = bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -191,8 +199,20 @@ def human_weather_line(data: dict) -> str:
     return f"Morning Davud! Around {data['temp_max']}°C today in {data['city']}.{umbrella}"
 
 
+def send_email_resend(to: str, subject: str, body: str) -> None:
+    """Send email via the Resend API — just needs RESEND_API_KEY (no app password)."""
+    r = requests.post(
+        "https://api.resend.com/emails",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json={"from": EMAIL_FROM, "to": [to], "subject": subject, "text": body},
+        timeout=20,
+    )
+    if r.status_code >= 300:
+        raise RuntimeError(f"Resend error {r.status_code}: {r.text}")
+
+
 def send_email_smtp(to: str, subject: str, body: str) -> None:
-    """Send a plain-text email over SMTP (e.g. Gmail with an App Password)."""
+    """Send a plain-text email over SMTP (e.g. Gmail/Yandex with an App Password)."""
     msg = EmailMessage()
     msg["From"] = EMAIL_FROM
     msg["To"] = to
@@ -207,6 +227,16 @@ def send_email_smtp(to: str, subject: str, body: str) -> None:
             s.starttls()
             s.login(SMTP_USER, SMTP_PASSWORD)
             s.send_message(msg)
+
+
+def send_email(to: str, subject: str, body: str) -> None:
+    """Send using whatever is configured: Resend if a key is set, otherwise SMTP."""
+    if RESEND_API_KEY:
+        send_email_resend(to, subject, body)
+    elif SMTP_USER and SMTP_PASSWORD:
+        send_email_smtp(to, subject, body)
+    else:
+        raise RuntimeError("No email method configured")
 
 
 # ---------- Telegram command handlers ----------
@@ -301,7 +331,7 @@ async def yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Nothing to confirm right now.")
         return
     try:
-        await asyncio.to_thread(send_email_smtp, e["to"], e["subject"], e["body"])
+        await asyncio.to_thread(send_email, e["to"], e["subject"], e["body"])
         await update.message.reply_text(f"Sent to {e['to']} ✅")
     except Exception as ex:
         print("EMAIL ERROR:", repr(ex))   # shows the real reason in the Replit console
