@@ -46,7 +46,7 @@ must press Start once.)
 Edit the top of `bot.py`: `CITY`, `PRICES`, `TIMEZONE`.
 
 ## Notes
-- Free stack: Gemini `gemini-2.5-flash` (free tier), Telegram Bot API, keyless Open-Meteo, and
+- Free stack: Gemini `gemini-3.8-flash` (free tier), Telegram Bot API, keyless Open-Meteo, and
   (optional) email via your own SMTP. Telegram relay + email are free; SMS/WhatsApp are not.
 - 🔒 Keep all keys in Secrets / `.env` — never in the code or shared. `.env`, `people.json` and
   `chats.json` are gitignored.

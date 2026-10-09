@@ -45,7 +45,7 @@ PRICES = {                                # the bot answers "how much...?" from 
     "haircut": "300 TL",
     "hair coloring": "800 TL",
 }
-MODEL = "gemini-2.5-flash"                # the AI brain (free tier is fine)
+MODEL = "gemini-3.8-flash"                # the AI brain (free tier is fine)
 # -----------------------------------------
 
 load_dotenv()
