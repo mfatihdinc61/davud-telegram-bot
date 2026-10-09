@@ -303,8 +303,9 @@ async def yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await asyncio.to_thread(send_email_smtp, e["to"], e["subject"], e["body"])
         await update.message.reply_text(f"Sent to {e['to']} ✅")
-    except Exception:
-        await update.message.reply_text("Couldn't send that one 😕 — check the email setup (SMTP keys / App Password).")
+    except Exception as ex:
+        print("EMAIL ERROR:", repr(ex))   # shows the real reason in the Replit console
+        await update.message.reply_text("Couldn't send that one 😕 — check the console for the reason (often the mail server blocking SMTP login).")
 
 
 async def no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
