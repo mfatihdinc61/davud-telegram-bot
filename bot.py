@@ -372,7 +372,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.bot.send_chat_action(chat_id, "typing")
     try:
         reply = await asyncio.to_thread(ask_gemini, chat_id, text)
-    except Exception:
+    except Exception as ex:
+        print("CHAT ERROR:", repr(ex))   # shows the real reason (e.g. bad Gemini key) in the console
         reply = "Oops, my brain hiccuped 😅 try again?"
     await update.message.reply_text(reply)
 
@@ -386,7 +387,8 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         tg_file = await photo.get_file()
         img_bytes = bytes(await tg_file.download_as_bytearray())
         reply = await asyncio.to_thread(ask_gemini_about_photo, img_bytes, update.message.caption or "")
-    except Exception:
+    except Exception as ex:
+        print("PHOTO ERROR:", repr(ex))
         reply = "Hmm, I couldn't open that photo 😅 mind sending it again?"
     await update.message.reply_text(reply)
 
