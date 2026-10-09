@@ -86,9 +86,10 @@ You have tools you can use:
   the recipient's address, a short subject, and the message. It does NOT send right away — after
   drafting, show Davud the recipient, subject and message, and ask him to reply "yes" to send or
   "no" to cancel.
+- send_to_friend: when Davud asks you to message or ask a friend something, call send_to_friend
+  with the friend's name and the message. It sends on Telegram right away (if that friend has
+  opened the bot), and their reply comes back to Davud.
 - check_weather: when Davud asks about the weather or what to wear, call check_weather with the city.
-
-To message a friend who has also opened you, tell Davud to use: /ask Name | your message
 
 Keep replies brief and friendly, like a real text conversation."""
 
@@ -118,6 +119,7 @@ people: dict = load_people()   # { "<chat_id>": {"name": "...", "username": "...
 history: dict[int, list] = {}          # short chat memory per person
 awaiting_reply: dict[int, tuple] = {}  # recipient_chat_id -> (sender_chat_id, sender_name)
 pending_email: dict[int, dict] = {}    # chat_id -> {"to","subject","body"} waiting for /yes
+pending_relay: dict[int, dict] = {}    # chat_id -> {"target","name","message"} queued by the AI
 
 
 def register_person(update: Update) -> None:
@@ -162,6 +164,18 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
         return (f"Email drafted to {to}, subject '{subject}'. Now show Davud the recipient, "
                 f"subject and message, then ask him to reply 'yes' to send or 'no' to cancel.")
 
+    def send_to_friend(name: str, message: str) -> str:
+        """Send a Telegram message to one of Davud's friends by name. Use when Davud asks to
+        message or ask a friend something. It sends right away and the friend's reply returns."""
+        target = find_chat_by_name(name)
+        if target is None:
+            return (f"{name} hasn't opened the bot yet, so you can't message them. Tell Davud that "
+                    f"{name} needs to open the bot and press Start first.")
+        if target == chat_id:
+            return "That's Davud himself — ask him which friend he means."
+        pending_relay[chat_id] = {"target": target, "name": name, "message": message}
+        return f"Message queued for {name}. Tell Davud you've sent it and will bring the reply back."
+
     def check_weather(city: str) -> str:
         """Get today's weather for a city. Use when Davud asks about the weather or what to wear."""
         try:
@@ -172,7 +186,7 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
 
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT, temperature=0.8,
-        tools=[draft_email, check_weather],
+        tools=[draft_email, send_to_friend, check_weather],
     )
     resp = client.models.generate_content(model=MODEL, contents=contents, config=config)
     reply = (resp.text or "").strip() or "Hmm, I didn't catch that — say it again?"
@@ -283,8 +297,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Ask about prices (e.g. \"how much is a haircut?\")\n"
         "• Ask me to email someone (e.g. \"email pat@x.com that I'll be late\") — I draft it and you confirm 📧\n"
         "• Ask about the weather or what to wear 🌦️\n"
+        "• Ask me to message a friend (e.g. \"ask Ayten if she's free\") — I send it and bring back the reply 📨\n"
         "• /who  — see which friends I know\n"
-        "• /ask Name | message  — send a friend a message and I'll bring their reply back\n"
+        "• /ask Name | message  — the manual way to message a friend\n"
         "• /email address | subject | message  — the manual way to draft an email\n"
         "• /testweather  — get the morning-style weather now")
 
@@ -414,13 +429,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Okay, cancelled. 👍")
             return
 
-    # Otherwise it's a normal chat with the AI.
+    # Otherwise it's a normal chat with the AI (which may use tools).
     await context.bot.send_chat_action(chat_id, "typing")
     try:
         reply = await asyncio.to_thread(ask_gemini, chat_id, text)
     except Exception as ex:
         print("CHAT ERROR:", repr(ex))   # shows the real reason (e.g. bad Gemini key) in the console
         reply = "Oops, my brain hiccuped 😅 try again?"
+
+    # If the AI queued a message to a friend, actually send it now.
+    relay = pending_relay.pop(chat_id, None)
+    if relay:
+        sender_name = people[str(chat_id)]["name"]
+        try:
+            await context.bot.send_message(
+                relay["target"],
+                f"📩 {sender_name} asks:\n\n{relay['message']}\n\n(Just reply here and I'll send your answer back.)")
+            awaiting_reply[relay["target"]] = (chat_id, sender_name)
+        except Exception as ex:
+            print("RELAY ERROR:", repr(ex))
+            reply += "\n\n(Hmm, I couldn't reach them just now 😕)"
+
     await update.message.reply_text(reply)
 
 
