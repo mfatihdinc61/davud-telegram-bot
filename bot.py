@@ -81,10 +81,14 @@ You know these prices and can answer "how much does it cost?" questions:
 {price_lines}
 If he asks about something not on the list, say you're not sure of that price.
 
-You can also do two actions through commands — if Davud asks how to message a friend or send an
-email, tell him:
-- To message a friend who has also opened me: /ask Name | your message
-- To send an email: /email address | subject | message
+You have tools you can use:
+- draft_email: when Davud asks you to send or write an email to someone, call draft_email with
+  the recipient's address, a short subject, and the message. It does NOT send right away — after
+  drafting, show Davud the recipient, subject and message, and ask him to reply "yes" to send or
+  "no" to cancel.
+- check_weather: when Davud asks about the weather or what to wear, call check_weather with the city.
+
+To message a friend who has also opened you, tell Davud to use: /ask Name | your message
 
 Keep replies brief and friendly, like a real text conversation."""
 
@@ -137,7 +141,7 @@ def find_chat_by_name(name: str):
 # ---------- the AI + network calls (blocking, so we run them in a thread) ----------
 
 def ask_gemini(chat_id: int, user_text: str) -> str:
-    """Reply to a text message, remembering the last few turns of the chat."""
+    """Reply to a text message, remembering recent turns and letting the AI use tools."""
     turns = history.setdefault(chat_id, [])
     turns.append({"role": "user", "text": user_text})
     turns[:] = turns[-10:]
@@ -145,10 +149,32 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
         types.Content(role=t["role"], parts=[types.Part.from_text(text=t["text"])])
         for t in turns
     ]
-    resp = client.models.generate_content(
-        model=MODEL, contents=contents,
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.8),
+
+    # ----- tools the AI can choose to call (they capture THIS chat's id) -----
+    def draft_email(to: str, subject: str, body: str) -> str:
+        """Draft an email for Davud to send. Use this whenever he asks to send or write an
+        email to someone. The email is NOT sent yet — it is staged for Davud to confirm."""
+        if not EMAIL_READY:
+            return "Email is not set up, so you can't send one. Let Davud know."
+        if ALLOWED_EMAILS and to.lower() not in ALLOWED_EMAILS:
+            return f"Not allowed to email {to}. You may only email: {', '.join(ALLOWED_EMAILS)}."
+        pending_email[chat_id] = {"to": to, "subject": subject, "body": body}
+        return (f"Email drafted to {to}, subject '{subject}'. Now show Davud the recipient, "
+                f"subject and message, then ask him to reply 'yes' to send or 'no' to cancel.")
+
+    def check_weather(city: str) -> str:
+        """Get today's weather for a city. Use when Davud asks about the weather or what to wear."""
+        try:
+            d = get_weather(city)
+            return f"{d['city']}: high {d['temp_max']}C, low {d['temp_min']}C, rain chance {d['rain_chance']}%."
+        except Exception:
+            return "Couldn't get the weather right now."
+
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT, temperature=0.8,
+        tools=[draft_email, check_weather],
     )
+    resp = client.models.generate_content(model=MODEL, contents=contents, config=config)
     reply = (resp.text or "").strip() or "Hmm, I didn't catch that — say it again?"
     turns.append({"role": "model", "text": reply})
     return reply
@@ -255,10 +281,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• Just chat with me 💬\n"
         "• Send me a photo 📷\n"
         "• Ask about prices (e.g. \"how much is a haircut?\")\n"
+        "• Ask me to email someone (e.g. \"email pat@x.com that I'll be late\") — I draft it and you confirm 📧\n"
+        "• Ask about the weather or what to wear 🌦️\n"
         "• /who  — see which friends I know\n"
         "• /ask Name | message  — send a friend a message and I'll bring their reply back\n"
-        "• /email address | subject | message  — I'll draft an email and ask you to confirm\n"
-        "• /testweather 🌦️  — get the morning-style weather now")
+        "• /email address | subject | message  — the manual way to draft an email\n"
+        "• /testweather  — get the morning-style weather now")
 
 
 async def who(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -367,6 +395,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             await update.message.reply_text("I couldn't deliver that reply 😕")
         return
+
+    # If an email draft is waiting, a plain "yes"/"no" sends or cancels it.
+    if chat_id in pending_email:
+        low = text.strip().lower()
+        if low in ("yes", "y", "yep", "yeah", "send", "send it", "ok", "okay", "go", "do it", "evet"):
+            e = pending_email.pop(chat_id)
+            await context.bot.send_chat_action(chat_id, "typing")
+            try:
+                await asyncio.to_thread(send_email, e["to"], e["subject"], e["body"])
+                await update.message.reply_text(f"Sent to {e['to']} ✅")
+            except Exception as ex:
+                print("EMAIL ERROR:", repr(ex))
+                await update.message.reply_text("Couldn't send that one 😕 — check the console for the reason.")
+            return
+        if low in ("no", "n", "nope", "cancel", "stop", "hayır"):
+            pending_email.pop(chat_id, None)
+            await update.message.reply_text("Okay, cancelled. 👍")
+            return
 
     # Otherwise it's a normal chat with the AI.
     await context.bot.send_chat_action(chat_id, "typing")

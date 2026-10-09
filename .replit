@@ -3,7 +3,7 @@
 # virtual environment (.venv) instead of the system — then run the bot.
 run = "test -d .venv || python -m venv .venv; . .venv/bin/activate && pip install --no-user -q -r requirements.txt && python bot.py"
 entrypoint = "bot.py"
-modules = ["python-3.11"]
+modules = ["python-3.12"]
 
 [nix]
 channel = "stable-24_05"
