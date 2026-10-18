@@ -61,7 +61,7 @@ The bot also tracks daily **Pre-Trip Inspections** for truck drivers, in a Teleg
 
 Manager commands (private): `/report` · `/leaderboard` · `/ptihelp`.
 Times are set by `PTI_REMINDER_HOUR` / `PTI_REPORT_HOUR` at the top of `bot.py`.
-*(Video proof is accepted as-is; only photos get the AI truck-check.)*
+*(Both photos and short videos get the AI truck-check. Telegram caps bot video downloads at ~20MB, so keep clips short.)*
 
 ## Change it
 Edit the top of `bot.py`: `CITY`, `PRICES`, `TIMEZONE`, `PTI_REMINDER_HOUR`, `PTI_REPORT_HOUR`.

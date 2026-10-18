@@ -299,6 +299,25 @@ def verify_truck_photo(image_bytes: bytes) -> tuple:
         return True, "could not verify — accepted"   # fail open: don't block a driver on an API hiccup
 
 
+def verify_truck_video(video_bytes: bytes, mime_type: str = "video/mp4") -> tuple:
+    """Ask the AI whether a short video really shows a truck. Returns (is_truck, short_reason)."""
+    prompt = ("You are checking a truck driver's daily pre-trip inspection video. "
+              "Does it clearly show a truck, lorry, or heavy goods vehicle? "
+              "Reply with 'YES' or 'NO' as the first word, then a short reason.")
+    try:
+        resp = client.models.generate_content(
+            model=MODEL,
+            contents=[types.Part.from_bytes(data=video_bytes, mime_type=mime_type or "video/mp4"),
+                      types.Part.from_text(text=prompt)],
+            config=types.GenerateContentConfig(temperature=0),
+        )
+        txt = (resp.text or "").strip()
+        return txt.upper().lstrip().startswith("YES"), txt
+    except Exception as ex:
+        print("PTI VIDEO VISION ERROR:", repr(ex))
+        return True, "could not verify — accepted"   # fail open on big/unsupported videos
+
+
 def record_pti(user_id: int, name: str) -> dict:
     """Log today's PTI for a driver and update their streak/total. Returns a small summary."""
     d = pti["drivers"].setdefault(str(user_id), {"name": name, "last_pti": None, "streak": 0, "total": 0})
@@ -615,7 +634,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # A video in the group also counts as a PTI submission (accepted as-is, no frame check).
+    # A video in the group is a PTI submission too — the AI checks it shows a truck.
     if update.effective_chat.type in ("group", "supergroup"):
         await handle_pti_video(update, context)
 
@@ -647,6 +666,23 @@ async def handle_pti_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     name = (user.first_name or user.username or "driver").strip()
     pti["group_chat_id"] = chat.id
     save_pti()
+    try:
+        video = update.message.video
+        tg_file = await video.get_file()
+        vid = bytes(await tg_file.download_as_bytearray())
+    except Exception as ex:
+        print("PTI VIDEO ERROR:", repr(ex))
+        await update.message.reply_text(
+            f"{name}, I couldn't open that video (Telegram caps bot downloads at ~20MB) — "
+            f"try a shorter clip or a photo.")
+        return
+    await update.message.reply_text(f"🎥 Got it, {name} — checking your video…")
+    ok, _reason = await asyncio.to_thread(verify_truck_video, vid, video.mime_type or "video/mp4")
+    if not ok:
+        await update.message.reply_text(
+            f"❌ {name}, that video doesn't clearly show a truck, so I can't count it as today's PTI. "
+            f"Please send a clear photo or video of the truck.")
+        return
     await _confirm_pti(update, user.id, name)
 
 
