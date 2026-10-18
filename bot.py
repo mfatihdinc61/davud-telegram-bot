@@ -7,6 +7,9 @@
 #   • send you a human-sounding weather heads-up each morning  (/testweather to try now)
 #   • relay a message to a friend and bring their reply back    (/ask  Name | message)
 #   • send an email on your behalf, with a confirm step         (/email to | subject | body)
+#   • FLEET PTI: in a drivers' group, drivers post a daily truck photo; the AI verifies it's a
+#     truck, logs each driver's streak, rewards milestones, and DMs the manager a daily report.
+#     Manager: /iammanager (in private) · /report · /leaderboard · /ptihelp
 #
 # HOW TO RUN (locally):
 #   1) pip install -r requirements.txt
@@ -46,6 +49,8 @@ PRICES = {                                # the bot answers "how much...?" from 
     "hair coloring": "800 TL",
 }
 MODEL = "gemini-3.8-flash"                # the AI brain (free tier is fine)
+PTI_REMINDER_HOUR = 8     # local time: nudge drivers who haven't done their truck PTI yet
+PTI_REPORT_HOUR = 11      # local time: DM the manager the daily did/didn't PTI report
 # -----------------------------------------
 
 load_dotenv()
@@ -120,6 +125,32 @@ history: dict[int, list] = {}          # short chat memory per person
 awaiting_reply: dict[int, tuple] = {}  # recipient_chat_id -> (sender_chat_id, sender_name)
 pending_email: dict[int, dict] = {}    # chat_id -> {"to","subject","body"} waiting for /yes
 pending_relay: dict[int, dict] = {}    # chat_id -> {"target","name","message"} queued by the AI
+
+# ---------- PTI (Pre-Trip Inspection) tracking ----------
+PTI_FILE = "pti.json"     # drivers + streaks + the group chat id + the manager chat id
+
+
+def load_pti() -> dict:
+    try:
+        with open(PTI_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data.setdefault("group_chat_id", None)
+    data.setdefault("manager_chat_id", None)
+    data.setdefault("drivers", {})     # "<user_id>": {"name","last_pti","streak","total"}
+    return data
+
+
+def save_pti() -> None:
+    try:
+        with open(PTI_FILE, "w", encoding="utf-8") as f:
+            json.dump(pti, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+pti: dict = load_pti()
 
 
 def register_person(update: Update) -> None:
@@ -237,6 +268,69 @@ def human_weather_line(data: dict) -> str:
         pass
     umbrella = " Take an umbrella ☔" if data["rain_chance"] >= 50 else ""
     return f"Morning Davud! Around {data['temp_max']}°C today in {data['city']}.{umbrella}"
+
+
+# ---------- PTI helpers ----------
+
+def _today() -> str:
+    return datetime.datetime.now(ZoneInfo(TIMEZONE)).date().isoformat()
+
+
+def _yesterday() -> str:
+    return (datetime.datetime.now(ZoneInfo(TIMEZONE)).date() - datetime.timedelta(days=1)).isoformat()
+
+
+def verify_truck_photo(image_bytes: bytes) -> tuple:
+    """Ask the AI whether the photo really shows a truck. Returns (is_truck, short_reason)."""
+    prompt = ("You are checking a truck driver's daily pre-trip inspection photo. "
+              "Does this image clearly show a truck, lorry, or heavy goods vehicle? "
+              "Reply with 'YES' or 'NO' as the first word, then a short reason.")
+    try:
+        resp = client.models.generate_content(
+            model=MODEL,
+            contents=[types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                      types.Part.from_text(text=prompt)],
+            config=types.GenerateContentConfig(temperature=0),
+        )
+        txt = (resp.text or "").strip()
+        return txt.upper().lstrip().startswith("YES"), txt
+    except Exception as ex:
+        print("PTI VISION ERROR:", repr(ex))
+        return True, "could not verify — accepted"   # fail open: don't block a driver on an API hiccup
+
+
+def record_pti(user_id: int, name: str) -> dict:
+    """Log today's PTI for a driver and update their streak/total. Returns a small summary."""
+    d = pti["drivers"].setdefault(str(user_id), {"name": name, "last_pti": None, "streak": 0, "total": 0})
+    d["name"] = name
+    if d["last_pti"] == _today():
+        return {"status": "already", "streak": d["streak"], "total": d["total"], "milestone": None}
+    d["streak"] = d["streak"] + 1 if d["last_pti"] == _yesterday() else 1
+    d["total"] += 1
+    d["last_pti"] = _today()
+    save_pti()
+    milestone = None
+    if d["streak"] in (7, 30, 100):
+        milestone = f"{d['streak']}-day streak"
+    elif d["total"] in (30, 100, 250):
+        milestone = f"{d['total']} inspections done"
+    return {"status": "ok", "streak": d["streak"], "total": d["total"], "milestone": milestone}
+
+
+def pti_report_text() -> str:
+    """Build the manager's daily did / didn't report."""
+    drivers = pti["drivers"]
+    if not drivers:
+        return "No drivers have done a PTI yet. Ask them to post a truck photo in the group."
+    t = _today()
+    done = [d for d in drivers.values() if d["last_pti"] == t]
+    missed = [d for d in drivers.values() if d["last_pti"] != t]
+    lines = [f"📋 PTI report — {t}", "", f"✅ Done ({len(done)}):"]
+    lines += ([f"   • {d['name']} — 🔥{d['streak']} (total {d['total']})"
+               for d in sorted(done, key=lambda x: -x["streak"])] or ["   —"])
+    lines += ["", f"❌ Missed today ({len(missed)}):"]
+    lines += ([f"   • {d['name']} — last: {d['last_pti'] or 'never'}" for d in missed] or ["   —"])
+    return "\n".join(lines)
 
 
 def send_email_resend(to: str, subject: str, body: str) -> None:
@@ -393,9 +487,57 @@ async def testweather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await send_morning(context)
 
 
+# ---------- PTI commands ----------
+
+async def iammanager(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Please send /iammanager to me in a private chat, not the group.")
+        return
+    pti["manager_chat_id"] = update.effective_chat.id
+    save_pti()
+    await update.message.reply_text(
+        "👔 You're set as the fleet manager. You'll get the daily PTI report and no-show alerts here.\n"
+        "Commands: /report (today's status) · /leaderboard · /ptihelp")
+
+
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mid = pti.get("manager_chat_id")
+    if mid and update.effective_chat.id != mid:
+        await update.message.reply_text("Only the manager can see the full report. (Try /leaderboard.)")
+        return
+    await update.message.reply_text(pti_report_text())
+
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    drivers = sorted(pti["drivers"].values(), key=lambda d: (-d["streak"], -d["total"]))
+    if not drivers:
+        await update.message.reply_text("No drivers yet — post a truck photo in the group to start.")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 PTI leaderboard (by streak):", ""]
+    for i, d in enumerate(drivers[:10]):
+        tag = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{tag} {d['name']} — 🔥{d['streak']} · total {d['total']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ptihelp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "🚚 PTI (Pre-Trip Inspection) bot\n\n"
+        "Drivers: each day, post a clear PHOTO or VIDEO of your truck in the group. "
+        "I check it's really a truck, then log your inspection and your streak.\n\n"
+        "Manager (private chat):\n"
+        "• /iammanager — set yourself as the manager\n"
+        "• /report — who did / didn't do PTI today\n"
+        "• /leaderboard — streak rankings")
+
+
 # ---------- message handlers ----------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # In a group the bot stays quiet (PTI happens via photos/commands) — no companion chit-chat.
+    if update.effective_chat.type in ("group", "supergroup"):
+        return
     chat_id = update.effective_chat.id
     register_person(update)
     text = update.message.text
@@ -454,6 +596,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # In a group, a photo is a driver's daily PTI submission.
+    if update.effective_chat.type in ("group", "supergroup"):
+        await handle_pti_photo(update, context)
+        return
     chat_id = update.effective_chat.id
     register_person(update)
     await context.bot.send_chat_action(chat_id, "typing")
@@ -466,6 +612,53 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         print("PHOTO ERROR:", repr(ex))
         reply = "Hmm, I couldn't open that photo 😅 mind sending it again?"
     await update.message.reply_text(reply)
+
+
+async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # A video in the group also counts as a PTI submission (accepted as-is, no frame check).
+    if update.effective_chat.type in ("group", "supergroup"):
+        await handle_pti_video(update, context)
+
+
+async def handle_pti_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat, user = update.effective_chat, update.effective_user
+    name = (user.first_name or user.username or "driver").strip()
+    pti["group_chat_id"] = chat.id          # remember the drivers' group for reminders/reports
+    save_pti()
+    try:
+        photo = update.message.photo[-1]
+        tg_file = await photo.get_file()
+        img = bytes(await tg_file.download_as_bytearray())
+    except Exception as ex:
+        print("PTI PHOTO ERROR:", repr(ex))
+        await update.message.reply_text(f"{name}, I couldn't open that photo — please send it again.")
+        return
+    ok, _reason = await asyncio.to_thread(verify_truck_photo, img)
+    if not ok:
+        await update.message.reply_text(
+            f"❌ {name}, that doesn't look like your truck, so I can't count it as today's PTI. "
+            f"Please send a clear photo of the truck.")
+        return
+    await _confirm_pti(update, user.id, name)
+
+
+async def handle_pti_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat, user = update.effective_chat, update.effective_user
+    name = (user.first_name or user.username or "driver").strip()
+    pti["group_chat_id"] = chat.id
+    save_pti()
+    await _confirm_pti(update, user.id, name)
+
+
+async def _confirm_pti(update: Update, user_id: int, name: str) -> None:
+    res = await asyncio.to_thread(record_pti, user_id, name)
+    if res["status"] == "already":
+        await update.message.reply_text(f"✅ {name}, today's PTI is already logged. 🔥 streak {res['streak']}")
+        return
+    msg = f"✅ PTI logged for {name} — cleared to load. 🔥 streak {res['streak']} · total {res['total']}"
+    if res["milestone"]:
+        msg += f"\n🏅 {res['milestone']} — great work, keep it up!"
+    await update.message.reply_text(msg)
 
 
 async def send_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -482,6 +675,34 @@ async def send_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
+async def pti_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nudge the group about drivers who still haven't done today's PTI."""
+    gid = pti.get("group_chat_id")
+    if not gid:
+        return
+    pending = [d["name"] for d in pti["drivers"].values() if d["last_pti"] != _today()]
+    if pending:
+        msg = ("🚚 Good morning, drivers! Time for today's Pre-Trip Inspection — post a clear "
+               "photo of your truck here.\n\nStill pending: " + ", ".join(pending))
+    else:
+        msg = "🚚 Morning! Everyone's PTI is already in. Nice work. ✅"
+    try:
+        await context.bot.send_message(gid, msg)
+    except Exception as ex:
+        print("PTI REMINDER ERROR:", repr(ex))
+
+
+async def pti_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """DM the manager the daily did/didn't report."""
+    mid = pti.get("manager_chat_id")
+    if not mid:
+        return
+    try:
+        await context.bot.send_message(mid, pti_report_text())
+    except Exception as ex:
+        print("PTI REPORT ERROR:", repr(ex))
+
+
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -493,11 +714,19 @@ def main() -> None:
     app.add_handler(CommandHandler("yes", yes))
     app.add_handler(CommandHandler("no", no))
     app.add_handler(CommandHandler("testweather", testweather))
+    # PTI (truck pre-trip inspection) commands
+    app.add_handler(CommandHandler("iammanager", iammanager))
+    app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("ptihelp", ptihelp))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.VIDEO, on_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    app.job_queue.run_daily(send_morning,
-                            time=datetime.time(hour=7, minute=30, tzinfo=ZoneInfo(TIMEZONE)))
+    tz = ZoneInfo(TIMEZONE)
+    app.job_queue.run_daily(send_morning, time=datetime.time(hour=7, minute=30, tzinfo=tz))
+    app.job_queue.run_daily(pti_reminder, time=datetime.time(hour=PTI_REMINDER_HOUR, minute=0, tzinfo=tz))
+    app.job_queue.run_daily(pti_report_job, time=datetime.time(hour=PTI_REPORT_HOUR, minute=0, tzinfo=tz))
 
     print("Ready!")
     app.run_polling()

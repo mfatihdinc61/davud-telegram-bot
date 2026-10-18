@@ -1,6 +1,7 @@
 .env
 chats.json
 people.json
+pti.json
 .venv/
 __pycache__/
 *.pyc
