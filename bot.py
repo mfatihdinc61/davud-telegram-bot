@@ -49,6 +49,8 @@ TIMEZONE = "Europe/Istanbul"              # used for PTI reminder/report times (
 PRICES = {}                               # the bot answers "how much...?" from this list; {} = off
 #   e.g. PRICES = {"local delivery": "..."}  — leave empty to turn the price feature off
 MODEL = "gemini-3.8-flash"                # the AI brain (free tier is fine)
+GROUP_REPLY_TO_ALL = False   # True = the bot answers EVERY group message; False = only greetings,
+                             # questions, PTI-related messages, or when it's @mentioned / replied-to
 PTI_REMINDER_HOUR = 8     # local time: nudge drivers who haven't done their truck PTI yet
 PTI_REPORT_HOUR = 11      # local time: DM the manager the daily did/didn't PTI report
 
@@ -671,11 +673,26 @@ GROUP_GREETINGS = {
     "iyi gunler", "iyi günler", "iyi aksamlar", "iyi akşamlar", "hola",
     "good morning", "good evening", "morning",
 }
+# Words that usually start a question (EN + TR), and words about the bot's own job. A group
+# message that is a question OR mentions any of these gets a reply (so real questions like
+# "what should I show in the video?" are answered, while idle chatter is left alone).
+GROUP_QWORDS = {
+    "what", "how", "why", "when", "where", "which", "who", "whose", "whom", "can", "could",
+    "should", "would", "do", "does", "did", "is", "are", "am", "was", "were", "will", "may",
+    "might", "ne", "nasil", "nasıl", "neden", "niye", "nicin", "niçin", "hangi", "kim",
+    "nerede", "nereye", "kac", "kaç",
+}
+GROUP_KEYWORDS = (
+    "pti", "inspect", "truck", "lorry", "walkaround", "walk-around", "checklist", "approv",
+    "tyre", "tire", "mirror", "plate", "headlight", "brake", "light", "photo", "video", "clip",
+    "streak", "dispatch", "muayene", "kontrol", "kamyon", "lastik", "ayna", "plaka", "fren", "onay",
+)
 
 
 async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """In a group the bot keeps out of normal driver chatter, but DOES reply when someone greets
-    it or addresses it (mention / reply) — so it never looks broken."""
+    """In a group the bot keeps out of idle driver chatter, but replies when it's greeted,
+    addressed (mention / reply), asked a question, or when the message is about its job (PTI,
+    trucks, photos/videos…). Set GROUP_REPLY_TO_ALL = True to answer every message."""
     msg = update.message
     text = (msg.text or "").strip()
     bot_un = (context.bot.username or "").lower()
@@ -685,8 +702,11 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         and msg.reply_to_message.from_user.id == context.bot.id)
     stripped = (low.replace("@" + bot_un, "") if bot_un else low).strip(" !.,?؟")
     greeting = stripped in GROUP_GREETINGS
-    if not (mentioned or reply_to_bot or greeting):
-        return   # ordinary chatter — stay quiet
+    first_word = stripped.split(" ", 1)[0] if stripped else ""
+    is_question = ("?" in text) or ("؟" in text) or (first_word in GROUP_QWORDS)
+    has_keyword = any(k in low for k in GROUP_KEYWORDS)
+    if not (GROUP_REPLY_TO_ALL or mentioned or reply_to_bot or greeting or is_question or has_keyword):
+        return   # idle chatter — stay quiet
 
     chat_id = update.effective_chat.id
     clean = (text.replace("@" + context.bot.username, "").strip() if (mentioned and context.bot.username) else text)
@@ -703,7 +723,8 @@ async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # In a group the bot only replies to greetings / when addressed (PTI itself is photos+videos).
+    # In a group the bot replies to greetings, questions, and PTI-related messages (see
+    # handle_group_text); PTI submissions themselves are the photos/videos handled elsewhere.
     if update.effective_chat.type in ("group", "supergroup"):
         await handle_group_text(update, context)
         return
