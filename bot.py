@@ -7,8 +7,10 @@
 #   • send you a human-sounding weather heads-up each morning  (/testweather to try now)
 #   • relay a message to a friend and bring their reply back    (/ask  Name | message)
 #   • send an email on your behalf, with a confirm step         (/email to | subject | body)
-#   • FLEET PTI: in a drivers' group, drivers post a daily truck photo; the AI verifies it's a
-#     truck, logs each driver's streak, rewards milestones, and DMs the manager a daily report.
+#   • FLEET PTI: in a drivers' group, drivers post a daily truck photo (quick proof) or a VIDEO
+#     walkaround — the AI runs the video against an editable inspection checklist (tyres, lights,
+#     plate, mirrors… see PTI_CRITERIA) and only logs it if the key items are visible. It tracks
+#     each driver's streak, rewards milestones, and DMs the manager a daily report.
 #     Manager: /iammanager (in private) · /report · /leaderboard · /ptihelp
 #
 # HOW TO RUN (locally):
@@ -51,6 +53,22 @@ PRICES = {                                # the bot answers "how much...?" from 
 MODEL = "gemini-3.8-flash"                # the AI brain (free tier is fine)
 PTI_REMINDER_HOUR = 8     # local time: nudge drivers who haven't done their truck PTI yet
 PTI_REPORT_HOUR = 11      # local time: DM the manager the daily did/didn't PTI report
+
+# PTI VIDEO CHECKLIST — when a driver posts a VIDEO walkaround, the AI checks it for each
+# item below and only logs the inspection if enough items are actually visible. Edit this
+# list for your fleet (keep each item short and specific — things the camera can SEE).
+PTI_CRITERIA = [
+    "front tyres look properly inflated and undamaged",
+    "rear tyres look properly inflated and undamaged",
+    "headlights and front indicators are present / intact",
+    "rear lights and brake lights are present / intact",
+    "number plate is visible and readable",
+    "both side mirrors are present and not broken",
+]
+PTI_REQUIRE_ALL = True            # True = every item must be visible to pass the inspection
+PTI_MIN_PASS = len(PTI_CRITERIA)  # if REQUIRE_ALL is False: how many items are enough to pass
+PTI_FAIL_OPEN = True              # on an AI/network error, accept the clip so a glitch never
+                                  # blocks a driver. Set False for a stricter, fail-closed check.
 # -----------------------------------------
 
 load_dotenv()
@@ -299,11 +317,46 @@ def verify_truck_photo(image_bytes: bytes) -> tuple:
         return True, "could not verify — accepted"   # fail open: don't block a driver on an API hiccup
 
 
-def verify_truck_video(video_bytes: bytes, mime_type: str = "video/mp4") -> tuple:
-    """Ask the AI whether a short video really shows a truck. Returns (is_truck, short_reason)."""
-    prompt = ("You are checking a truck driver's daily pre-trip inspection video. "
-              "Does it clearly show a truck, lorry, or heavy goods vehicle? "
-              "Reply with 'YES' or 'NO' as the first word, then a short reason.")
+def _parse_json(text: str) -> dict:
+    """Pull a JSON object out of the model's reply, even if it's wrapped in ```json fences."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        if t[:4].lower() == "json":
+            t = t[4:]
+    start, end = t.find("{"), t.rfind("}")
+    if start != -1 and end != -1:
+        t = t[start:end + 1]
+    return json.loads(t)
+
+
+def pti_need() -> int:
+    """How many checklist items must be visible to pass."""
+    return len(PTI_CRITERIA) if PTI_REQUIRE_ALL else max(1, min(PTI_MIN_PASS, len(PTI_CRITERIA)))
+
+
+def inspect_pti_video(video_bytes: bytes, mime_type: str = "video/mp4", only_idxs: list = None) -> dict:
+    """Check a PTI walkaround video against the checklist.
+
+    only_idxs = the 1-based PTI_CRITERIA indices to look for (default: all of them). On a
+    re-film we pass just the items still missing, so the driver can shoot a short clip of
+    only those.
+
+    Returns: {"error": bool, "found_idxs": set(indices seen), "notes": {idx: why-missing}}.
+    """
+    idxs = only_idxs or list(range(1, len(PTI_CRITERIA) + 1))
+    checklist = "\n".join(f"{i}. {PTI_CRITERIA[i - 1]}" for i in idxs)
+    prompt = (
+        "You are inspecting a truck driver's daily pre-trip inspection (PTI) WALKAROUND VIDEO. "
+        "The driver pans the camera around the truck. Go through the WHOLE clip and, for each "
+        "checklist item below, decide whether you can actually SEE it clearly in the footage.\n\n"
+        f"CHECKLIST (the number before each item is its id):\n{checklist}\n\n"
+        "Reply with ONLY a JSON object (no markdown, no commentary) shaped exactly like:\n"
+        '{\"items\": [{\"n\": <the item id>, \"present\": true, \"note\": \"short reason\"}]}\n'
+        "Give one entry per checklist item above, reusing its id as \"n\". Set present=true ONLY "
+        "if the item is genuinely visible; if it is not shown, blurry, or you are unsure, set "
+        "present=false and say why in the note (under 8 words)."
+    )
     try:
         resp = client.models.generate_content(
             model=MODEL,
@@ -311,11 +364,61 @@ def verify_truck_video(video_bytes: bytes, mime_type: str = "video/mp4") -> tupl
                       types.Part.from_text(text=prompt)],
             config=types.GenerateContentConfig(temperature=0),
         )
-        txt = (resp.text or "").strip()
-        return txt.upper().lstrip().startswith("YES"), txt
+        data = _parse_json(resp.text or "")
+        by_n = {int(it.get("n", 0)): it for it in data.get("items", []) if isinstance(it, dict)}
+        found, notes = set(), {}
+        for i in idxs:
+            it = by_n.get(i, {})
+            if bool(it.get("present", False)):
+                found.add(i)
+            else:
+                notes[i] = str(it.get("note", "")).strip()
+        return {"error": False, "found_idxs": found, "notes": notes}
     except Exception as ex:
         print("PTI VIDEO VISION ERROR:", repr(ex))
-        return True, "could not verify — accepted"   # fail open on big/unsupported videos
+        # fail open (accept the checked items) or closed, per PTI_FAIL_OPEN
+        return {"error": True, "found_idxs": set(idxs) if PTI_FAIL_OPEN else set(), "notes": {}}
+
+
+def pti_checklist_text(passed_idxs: set, carried_idxs: set = frozenset(), notes: dict = None) -> str:
+    """Pretty ✅/❌ list; items verified on an earlier clip today are tagged 'already verified'."""
+    notes = notes or {}
+    lines = []
+    for i, crit in enumerate(PTI_CRITERIA, start=1):
+        if i in passed_idxs:
+            tag = " — already verified earlier" if i in carried_idxs else ""
+            lines.append(f"✅ {crit}{tag}")
+        else:
+            extra = f" — {notes[i]}" if notes.get(i) else ""
+            lines.append(f"❌ {crit}{extra}")
+    return "\n".join(lines)
+
+
+# --- same-day inspection progress, so a driver can re-film only the missing items ---
+
+def get_pti_progress(user_id: int) -> set:
+    """Indices this driver already passed TODAY (empty if none / a new day)."""
+    d = pti["drivers"].get(str(user_id))
+    if not d:
+        return set()
+    p = d.get("pti_progress")
+    if not p or p.get("date") != _today():
+        return set()
+    return set(p.get("passed", []))
+
+
+def set_pti_progress(user_id: int, name: str, passed_idxs: set) -> None:
+    d = pti["drivers"].setdefault(str(user_id), {"name": name, "last_pti": None, "streak": 0, "total": 0})
+    d["name"] = name
+    d["pti_progress"] = {"date": _today(), "passed": sorted(passed_idxs)}
+    save_pti()
+
+
+def clear_pti_progress(user_id: int) -> None:
+    d = pti["drivers"].get(str(user_id))
+    if d and "pti_progress" in d:
+        d.pop("pti_progress", None)
+        save_pti()
 
 
 def record_pti(user_id: int, name: str) -> dict:
@@ -543,8 +646,14 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def ptihelp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🚚 PTI (Pre-Trip Inspection) bot\n\n"
-        "Drivers: each day, post a clear PHOTO or VIDEO of your truck in the group. "
-        "I check it's really a truck, then log your inspection and your streak.\n\n"
+        "Drivers, each day in the group:\n"
+        "• 🎥 Best: post a VIDEO walkaround of the truck. I check it against the inspection "
+        "checklist (tyres, lights, plate, mirrors…) and only log it if the key items are "
+        "clearly visible — you'll get a ✅/❌ list back.\n"
+        "• 📸 Or a quick PHOTO of the truck for a basic proof.\n"
+        "Pass it and I log your inspection and streak. If a video only passes some checks, "
+        "you can send a short follow-up clip of just the missing items — the rest still count "
+        "(same day).\n\n"
         "Manager (private chat):\n"
         "• /iammanager — set yourself as the manager\n"
         "• /report — who did / didn't do PTI today\n"
@@ -666,6 +775,13 @@ async def handle_pti_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     name = (user.first_name or user.username or "driver").strip()
     pti["group_chat_id"] = chat.id
     save_pti()
+
+    # Already fully logged today? Don't make them re-shoot.
+    driver = pti["drivers"].get(str(user.id))
+    if driver and driver.get("last_pti") == _today():
+        await update.message.reply_text(f"✅ {name}, today's PTI is already logged. 🔥 streak {driver['streak']}")
+        return
+
     try:
         video = update.message.video
         tg_file = await video.get_file()
@@ -674,16 +790,43 @@ async def handle_pti_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         print("PTI VIDEO ERROR:", repr(ex))
         await update.message.reply_text(
             f"{name}, I couldn't open that video (Telegram caps bot downloads at ~20MB) — "
-            f"try a shorter clip or a photo.")
+            f"send it normally (not 'as file'), keep it ~20s at 1080p/720p, or send a photo.")
         return
-    await update.message.reply_text(f"🎥 Got it, {name} — checking your video…")
-    ok, _reason = await asyncio.to_thread(verify_truck_video, vid, video.mime_type or "video/mp4")
-    if not ok:
+
+    need = pti_need()
+    all_idxs = list(range(1, len(PTI_CRITERIA) + 1))
+    prev = await asyncio.to_thread(get_pti_progress, user.id)   # items already passed earlier today
+    to_check = [i for i in all_idxs if i not in prev] or all_idxs
+
+    if prev:
         await update.message.reply_text(
-            f"❌ {name}, that video doesn't clearly show a truck, so I can't count it as today's PTI. "
-            f"Please send a clear photo or video of the truck.")
+            f"🎥 Thanks {name} — the {len(prev)} item(s) you already verified today still count; "
+            f"checking this clip for the {len(to_check)} that were missing…")
+    else:
+        await update.message.reply_text(f"🎥 Got it, {name} — running the inspection checklist…")
+
+    res = await asyncio.to_thread(inspect_pti_video, vid, video.mime_type or "video/mp4", to_check)
+    passed = prev | res["found_idxs"]
+
+    if len(passed) >= need:
+        if res["error"]:
+            await update.message.reply_text("🔎 Couldn't fully check this clip (too big / AI hiccup) — accepted.")
+        else:
+            await update.message.reply_text(
+                f"🔎 Inspection complete ({len(passed)}/{need} passed):\n"
+                f"{pti_checklist_text(passed, carried_idxs=prev)}")
+        await asyncio.to_thread(clear_pti_progress, user.id)
+        await _confirm_pti(update, user.id, name)
         return
-    await _confirm_pti(update, user.id, name)
+
+    # Not enough yet — save progress so the next clip only needs the missing items.
+    await asyncio.to_thread(set_pti_progress, user.id, name, passed)
+    missing = [PTI_CRITERIA[i - 1] for i in all_idxs if i not in passed]
+    body = (f"⚠️ {name}, {len(passed)}/{need} checks passed so far.\n\n"
+            f"{pti_checklist_text(passed, carried_idxs=prev, notes=res['notes'])}\n\n"
+            f"🎥 No need to redo the whole thing — just film a short clip showing: "
+            + ", ".join(missing) + ".")
+    await update.message.reply_text(body)
 
 
 async def _confirm_pti(update: Update, user_id: int, name: str) -> None:
