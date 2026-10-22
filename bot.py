@@ -298,25 +298,6 @@ def _yesterday() -> str:
     return (datetime.datetime.now(ZoneInfo(TIMEZONE)).date() - datetime.timedelta(days=1)).isoformat()
 
 
-def verify_truck_photo(image_bytes: bytes) -> tuple:
-    """Ask the AI whether the photo really shows a truck. Returns (is_truck, short_reason)."""
-    prompt = ("You are checking a truck driver's daily pre-trip inspection photo. "
-              "Does this image clearly show a truck, lorry, or heavy goods vehicle? "
-              "Reply with 'YES' or 'NO' as the first word, then a short reason.")
-    try:
-        resp = client.models.generate_content(
-            model=MODEL,
-            contents=[types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                      types.Part.from_text(text=prompt)],
-            config=types.GenerateContentConfig(temperature=0),
-        )
-        txt = (resp.text or "").strip()
-        return txt.upper().lstrip().startswith("YES"), txt
-    except Exception as ex:
-        print("PTI VISION ERROR:", repr(ex))
-        return True, "could not verify — accepted"   # fail open: don't block a driver on an API hiccup
-
-
 def _parse_json(text: str) -> dict:
     """Pull a JSON object out of the model's reply, even if it's wrapped in ```json fences."""
     t = (text or "").strip()
@@ -335,21 +316,29 @@ def pti_need() -> int:
     return len(PTI_CRITERIA) if PTI_REQUIRE_ALL else max(1, min(PTI_MIN_PASS, len(PTI_CRITERIA)))
 
 
-def inspect_pti_video(video_bytes: bytes, mime_type: str = "video/mp4", only_idxs: list = None) -> dict:
-    """Check a PTI walkaround video against the checklist.
+def inspect_pti_media(media_bytes: bytes, mime_type: str, only_idxs: list = None) -> dict:
+    """Check a PTI photo OR walkaround video against the checklist.
 
-    only_idxs = the 1-based PTI_CRITERIA indices to look for (default: all of them). On a
-    re-film we pass just the items still missing, so the driver can shoot a short clip of
-    only those.
+    Works for both images and videos (detected from mime_type). only_idxs = the 1-based
+    PTI_CRITERIA indices to look for (default: all). On a re-send we pass just the items still
+    missing, so the driver can send a short clip — or a photo — of only those.
 
     Returns: {"error": bool, "found_idxs": set(indices seen), "notes": {idx: why-missing}}.
     """
+    is_video = (mime_type or "").startswith("video")
     idxs = only_idxs or list(range(1, len(PTI_CRITERIA) + 1))
     checklist = "\n".join(f"{i}. {PTI_CRITERIA[i - 1]}" for i in idxs)
+    if is_video:
+        lead = ("You are inspecting a truck driver's daily pre-trip inspection (PTI) WALKAROUND "
+                "VIDEO. The driver pans the camera around the truck. Go through the WHOLE clip and, "
+                "for each checklist item below, decide whether you can actually SEE it clearly.")
+    else:
+        lead = ("You are inspecting a truck driver's daily pre-trip inspection (PTI) PHOTO. For each "
+                "checklist item below, decide whether you can actually SEE it clearly in this image. "
+                "A single photo usually shows only one or two items — that is fine: mark what is "
+                "genuinely visible and mark the rest not present.")
     prompt = (
-        "You are inspecting a truck driver's daily pre-trip inspection (PTI) WALKAROUND VIDEO. "
-        "The driver pans the camera around the truck. Go through the WHOLE clip and, for each "
-        "checklist item below, decide whether you can actually SEE it clearly in the footage.\n\n"
+        f"{lead}\n\n"
         f"CHECKLIST (the number before each item is its id):\n{checklist}\n\n"
         "Reply with ONLY a JSON object (no markdown, no commentary) shaped exactly like:\n"
         '{\"items\": [{\"n\": <the item id>, \"present\": true, \"note\": \"short reason\"}]}\n'
@@ -360,7 +349,7 @@ def inspect_pti_video(video_bytes: bytes, mime_type: str = "video/mp4", only_idx
     try:
         resp = client.models.generate_content(
             model=MODEL,
-            contents=[types.Part.from_bytes(data=video_bytes, mime_type=mime_type or "video/mp4"),
+            contents=[types.Part.from_bytes(data=media_bytes, mime_type=mime_type or "image/jpeg"),
                       types.Part.from_text(text=prompt)],
             config=types.GenerateContentConfig(temperature=0),
         )
@@ -375,7 +364,7 @@ def inspect_pti_video(video_bytes: bytes, mime_type: str = "video/mp4", only_idx
                 notes[i] = str(it.get("note", "")).strip()
         return {"error": False, "found_idxs": found, "notes": notes}
     except Exception as ex:
-        print("PTI VIDEO VISION ERROR:", repr(ex))
+        print("PTI VISION ERROR:", repr(ex))
         # fail open (accept the checked items) or closed, per PTI_FAIL_OPEN
         return {"error": True, "found_idxs": set(idxs) if PTI_FAIL_OPEN else set(), "notes": {}}
 
@@ -650,10 +639,10 @@ async def ptihelp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• 🎥 Best: post a VIDEO walkaround of the truck. I check it against the inspection "
         "checklist (tyres, lights, plate, mirrors…) and only log it if the key items are "
         "clearly visible — you'll get a ✅/❌ list back.\n"
-        "• 📸 Or a quick PHOTO of the truck for a basic proof.\n"
-        "Pass it and I log your inspection and streak. If a video only passes some checks, "
-        "you can send a short follow-up clip of just the missing items — the rest still count "
-        "(same day).\n\n"
+        "• 📸 Or send PHOTOS of the items — each photo is checked against the same list.\n"
+        "I log your inspection + streak once enough items are verified. If a video only passes "
+        "some checks, just send a short clip OR photos of the missing items — the ones you "
+        "already passed today still count.\n\n"
         "Manager (private chat):\n"
         "• /iammanager — set yourself as the manager\n"
         "• /report — who did / didn't do PTI today\n"
@@ -662,9 +651,47 @@ async def ptihelp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- message handlers ----------
 
+GROUP_GREETINGS = {
+    "hi", "hii", "hiii", "hey", "heyy", "hello", "helo", "yo", "sup", "hallo", "hiya",
+    "selam", "selamlar", "merhaba", "mrb", "slm", "naber", "gunaydin", "günaydın",
+    "iyi gunler", "iyi günler", "iyi aksamlar", "iyi akşamlar", "hola",
+    "good morning", "good evening", "morning",
+}
+
+
+async def handle_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """In a group the bot keeps out of normal driver chatter, but DOES reply when someone greets
+    it or addresses it (mention / reply) — so it never looks broken."""
+    msg = update.message
+    text = (msg.text or "").strip()
+    bot_un = (context.bot.username or "").lower()
+    low = text.lower()
+    mentioned = bool(bot_un) and ("@" + bot_un) in low
+    reply_to_bot = bool(msg.reply_to_message and msg.reply_to_message.from_user
+                        and msg.reply_to_message.from_user.id == context.bot.id)
+    stripped = (low.replace("@" + bot_un, "") if bot_un else low).strip(" !.,?؟")
+    greeting = stripped in GROUP_GREETINGS
+    if not (mentioned or reply_to_bot or greeting):
+        return   # ordinary chatter — stay quiet
+
+    chat_id = update.effective_chat.id
+    clean = (text.replace("@" + context.bot.username, "").strip() if (mentioned and context.bot.username) else text)
+    await context.bot.send_chat_action(chat_id, "typing")
+    try:
+        reply = await asyncio.to_thread(ask_gemini, chat_id, clean or "hi")
+    except Exception as ex:
+        print("GROUP CHAT ERROR:", repr(ex))
+        reply = f"👋 Hey {(update.effective_user.first_name or 'there').strip()}!"
+    # Group chats shouldn't trigger the email/relay tools — drop anything they queued.
+    pending_relay.pop(chat_id, None)
+    pending_email.pop(chat_id, None)
+    await msg.reply_text(reply)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # In a group the bot stays quiet (PTI happens via photos/commands) — no companion chit-chat.
+    # In a group the bot only replies to greetings / when addressed (PTI itself is photos+videos).
     if update.effective_chat.type in ("group", "supergroup"):
+        await handle_group_text(update, context)
         return
     chat_id = update.effective_chat.id
     register_person(update)
@@ -748,11 +775,21 @@ async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await handle_pti_video(update, context)
 
 
+def _logged_today(user_id: int) -> dict:
+    """The driver's record if they've already fully logged PTI today, else None."""
+    d = pti["drivers"].get(str(user_id))
+    return d if (d and d.get("last_pti") == _today()) else None
+
+
 async def handle_pti_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat, user = update.effective_chat, update.effective_user
     name = (user.first_name or user.username or "driver").strip()
     pti["group_chat_id"] = chat.id          # remember the drivers' group for reminders/reports
     save_pti()
+    done = _logged_today(user.id)
+    if done:
+        await update.message.reply_text(f"✅ {name}, today's PTI is already logged. 🔥 streak {done['streak']}")
+        return
     try:
         photo = update.message.photo[-1]
         tg_file = await photo.get_file()
@@ -761,13 +798,7 @@ async def handle_pti_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         print("PTI PHOTO ERROR:", repr(ex))
         await update.message.reply_text(f"{name}, I couldn't open that photo — please send it again.")
         return
-    ok, _reason = await asyncio.to_thread(verify_truck_photo, img)
-    if not ok:
-        await update.message.reply_text(
-            f"❌ {name}, that doesn't look like your truck, so I can't count it as today's PTI. "
-            f"Please send a clear photo of the truck.")
-        return
-    await _confirm_pti(update, user.id, name)
+    await _process_pti_media(update, user.id, name, img, "image/jpeg")
 
 
 async def handle_pti_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -775,13 +806,10 @@ async def handle_pti_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     name = (user.first_name or user.username or "driver").strip()
     pti["group_chat_id"] = chat.id
     save_pti()
-
-    # Already fully logged today? Don't make them re-shoot.
-    driver = pti["drivers"].get(str(user.id))
-    if driver and driver.get("last_pti") == _today():
-        await update.message.reply_text(f"✅ {name}, today's PTI is already logged. 🔥 streak {driver['streak']}")
+    done = _logged_today(user.id)
+    if done:
+        await update.message.reply_text(f"✅ {name}, today's PTI is already logged. 🔥 streak {done['streak']}")
         return
-
     try:
         video = update.message.video
         tg_file = await video.get_file()
@@ -790,41 +818,50 @@ async def handle_pti_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         print("PTI VIDEO ERROR:", repr(ex))
         await update.message.reply_text(
             f"{name}, I couldn't open that video (Telegram caps bot downloads at ~20MB) — "
-            f"send it normally (not 'as file'), keep it ~20s at 1080p/720p, or send a photo.")
+            f"send it normally (not 'as file'), keep it ~20s at 1080p/720p, or send photos of each item.")
         return
+    await _process_pti_media(update, user.id, name, vid, video.mime_type or "video/mp4")
 
+
+async def _process_pti_media(update: Update, user_id: int, name: str,
+                             media_bytes: bytes, mime_type: str) -> None:
+    """Shared PTI flow for a photo OR a video: check the still-missing checklist items against
+    the media, merge into today's progress, and log the PTI once enough items are covered.
+    Photos and videos feed the SAME daily progress, so a driver can finish a partial video by
+    sending photos of just the missing parts."""
+    kind = "clip" if (mime_type or "").startswith("video") else "photo"
     need = pti_need()
     all_idxs = list(range(1, len(PTI_CRITERIA) + 1))
-    prev = await asyncio.to_thread(get_pti_progress, user.id)   # items already passed earlier today
+    prev = await asyncio.to_thread(get_pti_progress, user_id)   # items already passed earlier today
     to_check = [i for i in all_idxs if i not in prev] or all_idxs
 
     if prev:
         await update.message.reply_text(
-            f"🎥 Thanks {name} — the {len(prev)} item(s) you already verified today still count; "
-            f"checking this clip for the {len(to_check)} that were missing…")
+            f"🔎 Thanks {name} — the {len(prev)} item(s) you already verified today still count; "
+            f"checking this {kind} for the {len(to_check)} still missing…")
     else:
-        await update.message.reply_text(f"🎥 Got it, {name} — running the inspection checklist…")
+        await update.message.reply_text(f"🔎 Got it, {name} — running the inspection checklist…")
 
-    res = await asyncio.to_thread(inspect_pti_video, vid, video.mime_type or "video/mp4", to_check)
+    res = await asyncio.to_thread(inspect_pti_media, media_bytes, mime_type, to_check)
     passed = prev | res["found_idxs"]
 
     if len(passed) >= need:
         if res["error"]:
-            await update.message.reply_text("🔎 Couldn't fully check this clip (too big / AI hiccup) — accepted.")
+            await update.message.reply_text(f"🔎 Couldn't fully check this {kind} (too big / AI hiccup) — accepted.")
         else:
             await update.message.reply_text(
                 f"🔎 Inspection complete ({len(passed)}/{need} passed):\n"
                 f"{pti_checklist_text(passed, carried_idxs=prev)}")
-        await asyncio.to_thread(clear_pti_progress, user.id)
-        await _confirm_pti(update, user.id, name)
+        await asyncio.to_thread(clear_pti_progress, user_id)
+        await _confirm_pti(update, user_id, name)
         return
 
-    # Not enough yet — save progress so the next clip only needs the missing items.
-    await asyncio.to_thread(set_pti_progress, user.id, name, passed)
+    # Not enough yet — save progress so the next photo/clip only needs the missing items.
+    await asyncio.to_thread(set_pti_progress, user_id, name, passed)
     missing = [PTI_CRITERIA[i - 1] for i in all_idxs if i not in passed]
     body = (f"⚠️ {name}, {len(passed)}/{need} checks passed so far.\n\n"
             f"{pti_checklist_text(passed, carried_idxs=prev, notes=res['notes'])}\n\n"
-            f"🎥 No need to redo the whole thing — just film a short clip showing: "
+            f"📸 No need to redo everything — just send a short clip, or photos, of: "
             + ", ".join(missing) + ".")
     await update.message.reply_text(body)
 
