@@ -1,7 +1,7 @@
 # Davud's Telegram buddy — a simple AI agent in one file.
 #
 # WHAT IT CAN DO:
-#   • chat like a friendly human (and call the user "Davud")
+#   • chat like a friendly fleet dispatcher ("Dispatch"); edit SYSTEM_PROMPT to re-skin it
 #   • look at photos you send
 #   • answer price questions (from the PRICES list below)
 #   • send you a human-sounding weather heads-up each morning  (/testweather to try now)
@@ -94,27 +94,33 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 # The agent's personality and rules (its "system prompt").
 price_lines = "\n".join(f"- {name}: {price}" for name, price in PRICES.items())
-SYSTEM_PROMPT = f"""You are a warm, friendly assistant texting with a person named Davud.
-Talk in a natural, human way: short messages, casual, at most one emoji. Always address him
-as "Davud". Be kind and encouraging.
+SYSTEM_PROMPT = f"""You are "Dispatch", a friendly, professional assistant for a trucking fleet,
+texting with drivers and the fleet manager. Talk like a helpful human dispatcher: short, clear
+messages, warm but to the point, at most one emoji. Address people naturally and use a person's
+first name if you know it — never invent or assume a name.
 
-If Davud asks whether you are an AI or a real person, answer honestly that you are an AI helper.
+If someone asks whether you are an AI or a real person, answer honestly that you are an AI assistant.
 
-You know these prices and can answer "how much does it cost?" questions:
+Your main job is the daily Pre-Trip Inspection (PTI): in the drivers' group, each driver posts a
+photo or a short walkaround video of their truck; the bot checks it against the inspection
+checklist and logs their streak. If a driver asks how PTI works or what to send, explain it simply
+and point them to /ptihelp.
+
+The company gave you this price/rate list; answer "how much…?" questions from it, and say you're
+not sure if something isn't on it:
 {price_lines}
-If he asks about something not on the list, say you're not sure of that price.
 
 You have tools you can use:
-- draft_email: when Davud asks you to send or write an email to someone, call draft_email with
-  the recipient's address, a short subject, and the message. It does NOT send right away — after
-  drafting, show Davud the recipient, subject and message, and ask him to reply "yes" to send or
-  "no" to cancel.
-- send_to_friend: when Davud asks you to message or ask a friend something, call send_to_friend
-  with the friend's name and the message. It sends on Telegram right away (if that friend has
-  opened the bot), and their reply comes back to Davud.
-- check_weather: when Davud asks about the weather or what to wear, call check_weather with the city.
+- check_weather: when someone asks about the weather or road/driving conditions, call check_weather
+  with the city.
+- draft_email: if someone asks you to send or write an email, call draft_email with the recipient's
+  address, a short subject, and the message. It does NOT send right away — show the recipient,
+  subject and message, and ask them to reply "yes" to send or "no" to cancel.
+- send_to_friend: if someone asks you to pass a message to a colleague by name, call send_to_friend
+  with the name and the message; it sends on Telegram right away (if they've opened the bot) and
+  their reply comes back to the sender.
 
-Keep replies brief and friendly, like a real text conversation."""
+Keep replies brief and professional, like a real dispatcher texting back."""
 
 # ---------- saved data (survives restarts) ----------
 PEOPLE_FILE = "people.json"   # everyone who has opened the bot: name -> chat id
@@ -203,30 +209,30 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
 
     # ----- tools the AI can choose to call (they capture THIS chat's id) -----
     def draft_email(to: str, subject: str, body: str) -> str:
-        """Draft an email for Davud to send. Use this whenever he asks to send or write an
-        email to someone. The email is NOT sent yet — it is staged for Davud to confirm."""
+        """Draft an email for the user to send. Use this whenever they ask to send or write an
+        email to someone. The email is NOT sent yet — it is staged for the user to confirm."""
         if not EMAIL_READY:
-            return "Email is not set up, so you can't send one. Let Davud know."
+            return "Email is not set up, so you can't send one. Let the user know."
         if ALLOWED_EMAILS and to.lower() not in ALLOWED_EMAILS:
             return f"Not allowed to email {to}. You may only email: {', '.join(ALLOWED_EMAILS)}."
         pending_email[chat_id] = {"to": to, "subject": subject, "body": body}
-        return (f"Email drafted to {to}, subject '{subject}'. Now show Davud the recipient, "
-                f"subject and message, then ask him to reply 'yes' to send or 'no' to cancel.")
+        return (f"Email drafted to {to}, subject '{subject}'. Now show the user the recipient, "
+                f"subject and message, then ask them to reply 'yes' to send or 'no' to cancel.")
 
     def send_to_friend(name: str, message: str) -> str:
-        """Send a Telegram message to one of Davud's friends by name. Use when Davud asks to
-        message or ask a friend something. It sends right away and the friend's reply returns."""
+        """Relay a Telegram message to a colleague by name. Use when the user asks to message or
+        ask a colleague something. It sends right away and the colleague's reply returns."""
         target = find_chat_by_name(name)
         if target is None:
-            return (f"{name} hasn't opened the bot yet, so you can't message them. Tell Davud that "
+            return (f"{name} hasn't opened the bot yet, so you can't message them. Tell the user that "
                     f"{name} needs to open the bot and press Start first.")
         if target == chat_id:
-            return "That's Davud himself — ask him which friend he means."
+            return "That's the user themselves — ask which colleague they mean."
         pending_relay[chat_id] = {"target": target, "name": name, "message": message}
-        return f"Message queued for {name}. Tell Davud you've sent it and will bring the reply back."
+        return f"Message queued for {name}. Tell the user you've sent it and will bring the reply back."
 
     def check_weather(city: str) -> str:
-        """Get today's weather for a city. Use when Davud asks about the weather or what to wear."""
+        """Get today's weather for a city. Use when the user asks about weather or driving conditions."""
         try:
             d = get_weather(city)
             return f"{d['city']}: high {d['temp_max']}C, low {d['temp_min']}C, rain chance {d['rain_chance']}%."
@@ -244,7 +250,7 @@ def ask_gemini(chat_id: int, user_text: str) -> str:
 
 
 def ask_gemini_about_photo(image_bytes: bytes, caption: str) -> str:
-    question = caption.strip() or "Davud sent you this photo. React warmly and briefly, and say what you see."
+    question = caption.strip() or "Someone sent you this photo. React briefly and professionally, and say what you see."
     contents = [types.Content(role="user", parts=[
         types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
         types.Part.from_text(text=question),
@@ -253,7 +259,7 @@ def ask_gemini_about_photo(image_bytes: bytes, caption: str) -> str:
         model=MODEL, contents=contents,
         config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.7),
     )
-    return (resp.text or "").strip() or "Nice photo, Davud! 📷"
+    return (resp.text or "").strip() or "Thanks for the photo. 📷"
 
 
 def get_weather(city: str) -> dict:
@@ -272,10 +278,11 @@ def get_weather(city: str) -> dict:
 
 
 def human_weather_line(data: dict) -> str:
-    prompt = (f"Write ONE short, warm, human text to Davud about today's weather in {data['city']}. "
+    prompt = (f"Write ONE short, friendly dispatcher text to the drivers about today's weather and "
+              f"driving conditions in {data['city']}. "
               f"High {data['temp_max']}°C, low {data['temp_min']}°C, rain chance {data['rain_chance']}%. "
-              f"Mention taking an umbrella only if rain chance is 50% or more. "
-              f"Under 25 words, casual, at most one emoji.")
+              f"Mention wet roads / taking care only if rain chance is 50% or more. "
+              f"Under 25 words, professional but warm, at most one emoji.")
     try:
         resp = client.models.generate_content(model=MODEL, contents=prompt,
                                                config=types.GenerateContentConfig(temperature=0.9))
@@ -284,8 +291,8 @@ def human_weather_line(data: dict) -> str:
             return line
     except Exception:
         pass
-    umbrella = " Take an umbrella ☔" if data["rain_chance"] >= 50 else ""
-    return f"Morning Davud! Around {data['temp_max']}°C today in {data['city']}.{umbrella}"
+    umbrella = " Wet roads — drive safe ☔" if data["rain_chance"] >= 50 else ""
+    return f"Morning, team! Around {data['temp_max']}°C today in {data['city']}.{umbrella}"
 
 
 # ---------- PTI helpers ----------
@@ -489,8 +496,8 @@ def send_email(to: str, subject: str, body: str) -> None:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_person(update)
     await update.message.reply_text(
-        "Hey Davud! 👋 I'm here whenever you need me. Ask me anything, send a photo, "
-        "or type /help to see what I can do.")
+        "👋 Dispatch here. I handle daily truck pre-trip inspections and quick questions. "
+        "Send a truck photo/video for your PTI, ask me anything, or type /help · /ptihelp.")
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -883,7 +890,7 @@ async def send_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
         data = await asyncio.to_thread(get_weather, CITY)
         line = await asyncio.to_thread(human_weather_line, data)
     except Exception:
-        line = "Morning Davud! Couldn't check the weather right now 😅"
+        line = "Morning, team! Couldn't check the weather right now 😅"
     for cid in list(people.keys()):
         try:
             await context.bot.send_message(int(cid), line)
