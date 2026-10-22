@@ -44,12 +44,10 @@ from telegram.ext import (
 )
 
 # ---------- things you can edit ----------
-CITY = "Istanbul"                         # city for the morning weather heads-up
-TIMEZONE = "Europe/Istanbul"              # so the morning message fires at local 07:30
-PRICES = {                                # the bot answers "how much...?" from this list
-    "haircut": "300 TL",
-    "hair coloring": "800 TL",
-}
+CITY = ""                                 # city for the morning weather heads-up; "" = disabled
+TIMEZONE = "Europe/Istanbul"              # used for PTI reminder/report times (and weather, if set)
+PRICES = {}                               # the bot answers "how much...?" from this list; {} = off
+#   e.g. PRICES = {"local delivery": "..."}  — leave empty to turn the price feature off
 MODEL = "gemini-3.8-flash"                # the AI brain (free tier is fine)
 PTI_REMINDER_HOUR = 8     # local time: nudge drivers who haven't done their truck PTI yet
 PTI_REPORT_HOUR = 11      # local time: DM the manager the daily did/didn't PTI report
@@ -93,7 +91,13 @@ EMAIL_READY = bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASSWORD))
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # The agent's personality and rules (its "system prompt").
-price_lines = "\n".join(f"- {name}: {price}" for name, price in PRICES.items())
+# The price/rate block only appears in the persona when PRICES has entries.
+if PRICES:
+    _price_lines = "\n".join(f"- {name}: {price}" for name, price in PRICES.items())
+    price_block = ('The company gave you this price/rate list; answer "how much…?" questions from '
+                   "it, and say you're not sure if something isn't on it:\n" + _price_lines)
+else:
+    price_block = ""
 SYSTEM_PROMPT = f"""You are "Dispatch", a friendly, professional assistant for a trucking fleet,
 texting with drivers and the fleet manager. Talk like a helpful human dispatcher: short, clear
 messages, warm but to the point, at most one emoji. Address people naturally and use a person's
@@ -106,9 +110,7 @@ photo or a short walkaround video of their truck; the bot checks it against the 
 checklist and logs their streak. If a driver asks how PTI works or what to send, explain it simply
 and point them to /ptihelp.
 
-The company gave you this price/rate list; answer "how much…?" questions from it, and say you're
-not sure if something isn't on it:
-{price_lines}
+{price_block}
 
 You have tools you can use:
 - check_weather: when someone asks about the weather or road/driving conditions, call check_weather
@@ -602,6 +604,11 @@ async def no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def testweather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_person(update)
+    if not CITY:
+        await update.message.reply_text(
+            "No default city is set, so there's no morning weather. Ask me \"weather in <city>\" "
+            "any time, or set CITY at the top of bot.py to turn the daily heads-up back on.")
+        return
     await send_morning(context)
 
 
@@ -885,7 +892,9 @@ async def _confirm_pti(update: Update, user_id: int, name: str) -> None:
 
 
 async def send_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Runs automatically each morning (and from /testweather)."""
+    """Runs automatically each morning (and from /testweather). No-op if no CITY is set."""
+    if not CITY:
+        return
     try:
         data = await asyncio.to_thread(get_weather, CITY)
         line = await asyncio.to_thread(human_weather_line, data)
@@ -947,7 +956,8 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     tz = ZoneInfo(TIMEZONE)
-    app.job_queue.run_daily(send_morning, time=datetime.time(hour=7, minute=30, tzinfo=tz))
+    if CITY:   # only schedule the morning weather heads-up when a default city is set
+        app.job_queue.run_daily(send_morning, time=datetime.time(hour=7, minute=30, tzinfo=tz))
     app.job_queue.run_daily(pti_reminder, time=datetime.time(hour=PTI_REMINDER_HOUR, minute=0, tzinfo=tz))
     app.job_queue.run_daily(pti_report_job, time=datetime.time(hour=PTI_REPORT_HOUR, minute=0, tzinfo=tz))
 
